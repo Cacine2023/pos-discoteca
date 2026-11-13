@@ -1,5 +1,5 @@
 // Service Worker do POS offline: guarda a aplicação (não os dados) para abrir sem internet.
-var VERSAO = 'pos-v1';
+var VERSAO = 'pos-v2';
 var FICHEIROS = ['./', './index.html', './app.js', './manifest.webmanifest', './icon.svg'];
 self.addEventListener('install', function (e) { e.waitUntil(caches.open(VERSAO).then(function (c) { return c.addAll(FICHEIROS); }).then(function () { return self.skipWaiting(); })); });
 self.addEventListener('activate', function (e) {
