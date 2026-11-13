@@ -13,7 +13,7 @@
 
   var S = {
     url: ler('pos_url', ''), sess: ler('pos_sess', null), boot: ler('pos_boot', null), refs: ler('pos_refs', null), caixa: ler('pos_caixa', null),
-    fila: ler('pos_fila', []), mesas: ler('pos_mesas', []), mesaAtiva: null, dev: ler('pos_dev', null), seq: ler('pos_seq', 0), cart: [], cat: '', q: '', online: navigator.onLine, aSincronizar: false
+    fila: ler('pos_fila', []), mesas: ler('pos_mesas', []), mesasHora: ler('pos_mesas_hora', 0), mesaAtiva: null, dev: ler('pos_dev', null), seq: ler('pos_seq', 0), cart: [], cat: '', q: '', online: navigator.onLine, aSincronizar: false
   };
   if (!S.dev) { S.dev = 'T' + Math.random().toString(36).slice(2, 5).toUpperCase(); gravar('pos_dev', S.dev); }
 
@@ -79,7 +79,7 @@
   function atualizar(silencioso) {
     if (!S.sess) return Promise.resolve();
     return Promise.all([chamar('bootstrap', {}), chamar('refs', {}), chamar('caixa_estado', {}), chamar('mesas_abertas', {})]).then(function (r) {
-      S.boot = r[0]; S.refs = r[1]; S.caixa = r[2]; S.mesas = r[3].rows; gravar('pos_mesas', S.mesas); gravar('pos_boot', S.boot); gravar('pos_refs', S.refs); gravar('pos_caixa', S.caixa); gravar('pos_hora', Date.now());
+      S.boot = r[0]; S.refs = r[1]; S.caixa = r[2]; S.mesas = r[3].rows; S.mesasResumo = r[3].resumo; S.mesasHora = Date.now(); gravar('pos_mesas', S.mesas); gravar('pos_mesas_hora', S.mesasHora); gravar('pos_boot', S.boot); gravar('pos_refs', S.refs); gravar('pos_caixa', S.caixa); gravar('pos_hora', Date.now());
       if (!silencioso) toast('Dados atualizados.'); render();
     }).catch(function (e) { if (e.servidor && /Sess[aã]o expirada/i.test(e.message)) { S.sess = null; gravar('pos_sess', null); render(); } barra(); });
   }
@@ -111,6 +111,7 @@
     el.innerHTML = '<b>' + esc((S.boot && S.boot.cfg && S.boot.cfg.EMPRESA) || 'POS') + '</b><span class="dot ' + (S.online ? 'on' : '') + '"></span><span class="mut">' + (S.online ? 'online' : 'offline') + '</span><span class="sp"></span>' +
       (p ? '<span class="badge">' + p + ' por enviar</span>' : '') + (er ? '<span class="badge" style="background:var(--bad);color:#fff">' + er + ' com erro</span>' : '') +
       '<button class="sec" id="bs">' + (S.aSincronizar ? 'A enviar…' : 'Sincronizar') + '</button><button class="sec" id="bm">Mesas</button><button class="sec" id="bf">Vendas</button><button class="sec" id="bx">Sair</button>';
+    faixa();
     $('#bs').onclick = function () { sincronizar(false); };
     $('#bm').onclick = ecraMesas;
     $('#bf').onclick = ecraFila;
@@ -134,7 +135,7 @@
     raiz.innerHTML = '<div class="top" id="bar"></div>' + alerta +
       (!cx ? '<div class="note err" style="margin:12px">Sem caixa aberta (nos últimos dados recebidos). Peça ao gerente para abrir a sua caixa e carregue em Sincronizar.</div>' : '') +
       (!S.online && hora ? '<div class="note" style="margin:12px">Modo offline. Preços e produtos de ' + new Date(hora).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) + '. As vendas serão enviadas quando houver rede.</div>' : '') +
-      '<div class="wrap"><div><input id="q" placeholder="Procurar produto…"><div class="cats" id="cats"></div><div class="grid" id="gr"></div></div><div class="card cart" id="cart" style="margin:0"></div></div>';
+      '<div id="faixa"></div><div class="wrap"><div><input id="q" placeholder="Procurar produto…"><div class="cats" id="cats"></div><div class="grid" id="gr"></div></div><div class="card cart" id="cart" style="margin:0"></div></div>';
     $('#q').oninput = function () { S.q = this.value.toLowerCase(); grelha(); };
     barra(); cats(); grelha(); carrinho();
   }
@@ -182,19 +183,44 @@
     var l = linhasMesa(m);
     return '<div class="note" style="margin:6px 0"><b>Já pedido</b>' + (l.length ? l.map(function (x) { return '<div style="font-size:13px">' + x.qtd + '× ' + esc(x.nome) + ' <span class="mut">· ' + esc(x.quem || '') + (x.pend ? ' (por enviar)' : '') + '</span></div>'; }).join('') : '<div class="mut" style="font-size:13px">Mesa nova.</div>') + '</div>';
   }
-  function ecraMesas() {
-    var lista = S.mesas.slice();
-    S.fila.forEach(function (v) { // mesas abertas só neste aparelho (pedido ainda por enviar)
-      if (v.tipo === 'pedido' && v.estado !== 'enviada' && !lista.some(function (m) { return chaveMesa(m.mesa) === chaveMesa(v.mesa); })) lista.push({ id: '', mesa: v.mesa, operador: v.operador, total: 0, linhas: [], nova: true });
+  function dur(m) { m = Math.max(0, Math.round(Number(m) || 0)); return m < 60 ? m + ' min' : Math.floor(m / 60) + 'h' + ('0' + (m % 60)).slice(-2); }
+  function listaMesas() { // mesas do servidor + as que só existem neste aparelho (pedido por enviar)
+    var dec = S.mesasHora ? (Date.now() - S.mesasHora) / 60000 : 0, alerta = Number(S.boot && S.boot.cfg && S.boot.cfg.MESA_ALERTA_MIN) || 90;
+    var lista = (S.mesas || []).map(function (m) { var x = Object.assign({}, m); x.minutos = (m.minutos || 0) + dec; x.minutosUltimo = (m.minutosUltimo || 0) + dec; x.parada = x.minutosUltimo >= alerta; return x; });
+    S.fila.forEach(function (v) {
+      if (v.tipo === 'pedido' && v.estado !== 'enviada') {
+        var ex = lista.filter(function (m) { return (v.mesaId && m.id === v.mesaId) || chaveMesa(m.mesa) === chaveMesa(v.mesa); })[0];
+        if (!ex) { ex = { id: '', mesa: v.mesa, operador: v.operador, total: 0, linhas: [], nova: true, minutos: 0, minutosUltimo: 0, nPedidos: 0 }; lista.push(ex); }
+        ex.pend = (ex.pend || 0) + 1;
+      }
     });
-    modal('<h3 style="margin-top:0">Mesas abertas</h3>' + (S.online ? '' : '<p class="mut">Offline: lista da última sincronização.</p>') + (lista.length ? '<table>' + lista.map(function (m, ix) {
-      return '<tr><td><b>' + esc(m.mesa) + '</b><div class="mut">' + esc(m.operador || '') + (m.nova ? ' · só neste aparelho' : '') + '</div></td><td style="text-align:right">' + fmt(m.total) + '</td><td><button data-ix="' + ix + '">Abrir</button></td></tr>';
+    return lista;
+  }
+  function minha(m) { var u = S.sess && S.sess.user || {}; return m.nova || !m.operador || m.operador === u.nome || u.papel === 'GERENTE' || u.papel === 'ADMIN'; }
+  function abrirDaLista(x) {
+    if (!minha(x)) return toast('A mesa ' + x.mesa + ' está a cargo de ' + x.operador + '. Só ele (ou o gerente) lança pedidos; peça a transferência no sistema principal.', true);
+    S.mesaAtiva = { id: x.id, mesa: x.mesa, linhas: x.linhas || [] }; S.cart = []; carrinho();
+  }
+  function faixa() {
+    var el = $('#faixa'); if (!el) return;
+    var l = listaMesas();
+    if (!l.length) { el.innerHTML = ''; return; }
+    var tot = l.reduce(function (a, m) { return a + (Number(m.total) || 0); }, 0), par = l.filter(function (m) { return m.parada; }).length;
+    el.innerHTML = '<div class="note" style="margin:8px 12px"><div class="mut" style="margin-bottom:6px"><b>' + l.length + ' mesa(s) aberta(s)</b> · ' + fmt(tot) + ' FCFA' + (par ? ' · <span style="color:var(--bad)">' + par + ' parada(s)</span>' : '') + (S.mesasHora ? ' · atualizado às ' + new Date(S.mesasHora).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) : '') + '</div><div class="cats" style="padding:0">' +
+      l.map(function (m, ix) { return '<span class="chip" data-fm="' + ix + '"' + (m.parada ? ' style="outline:2px solid var(--bad)"' : '') + '><b>' + esc(m.mesa) + '</b> ' + fmt(m.total) + (m.nova ? '' : ' · ' + dur(m.minutosUltimo)) + (m.pend ? ' ⏳' : '') + '</span>'; }).join('') + '</div></div>';
+    $$('#faixa [data-fm]').forEach(function (c) { c.onclick = function () { abrirDaLista(l[Number(c.getAttribute('data-fm'))]); }; });
+  }
+  function ecraMesas() {
+    var lista = listaMesas();
+    modal('<h3 style="margin-top:0">Mesas abertas</h3>' + (S.online ? '' : '<p class="mut">Offline: lista de ' + (S.mesasHora ? new Date(S.mesasHora).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) : 'última sincronização') + '.</p>') + (lista.length ? '<table>' + lista.map(function (m, ix) {
+      return '<tr><td><b>' + esc(m.mesa) + '</b>' + (m.parada ? ' <span style="color:var(--bad)">parada</span>' : '') + '<div class="mut">' + 'servidor: ' + esc(m.operador || '') + (m.nova ? ' · só neste aparelho' : ' · aberta há ' + dur(m.minutos) + ' · ' + (m.nPedidos || 0) + ' pedido(s) · último há ' + dur(m.minutosUltimo)) + (m.pend ? ' · ' + m.pend + ' por enviar' : '') + '</div></td><td style="text-align:right">' + fmt(m.total) + '</td><td><button data-ix="' + ix + '">Abrir</button></td></tr>';
     }).join('') + '</table>' : '<p class="mut">Não há mesas abertas.</p>') + '<div class="f" style="margin-top:12px"><label>Nova mesa</label><input id="nm" placeholder="nome ou número"></div><div class="row acts"><button class="sec" id="mx">Fechar</button><button id="mk">Abrir mesa</button></div>', function (m) {
       $('#mx', m).onclick = function () { m.remove(); };
-      $$('[data-ix]', m).forEach(function (b) { b.onclick = function () { var x = lista[Number(b.getAttribute('data-ix'))]; S.mesaAtiva = { id: x.id, mesa: x.mesa, linhas: x.linhas || [] }; S.cart = []; m.remove(); carrinho(); }; });
+      $$('[data-ix]', m).forEach(function (b) { b.onclick = function () { var x = lista[Number(b.getAttribute('data-ix'))]; if (!minha(x)) return abrirDaLista(x); m.remove(); abrirDaLista(x); }; });
       $('#mk', m).onclick = function () {
         var n = $('#nm', m).value.trim(); if (!n) return toast('Indique o nome da mesa.', true);
         var ex = lista.filter(function (x) { return chaveMesa(x.mesa) === chaveMesa(n); })[0];
+        if (ex && !minha(ex)) return abrirDaLista(ex);
         S.mesaAtiva = ex ? { id: ex.id, mesa: ex.mesa, linhas: ex.linhas || [] } : { id: '', mesa: n, linhas: [] }; S.cart = []; m.remove(); carrinho();
       };
     });
@@ -316,6 +342,7 @@
   window.addEventListener('beforeunload', function (e) { if (pendentes().length) { e.preventDefault(); e.returnValue = ''; } });
   setInterval(function () { if (S.sess && navigator.onLine) { sincronizar(true); } }, 60000);
   setInterval(function () { if (S.sess && navigator.onLine && !pendentes().length) atualizar(true); }, 300000);
+  setInterval(function () { if (S.sess && S.online && navigator.onLine) chamar('mesas_abertas', {}).then(function (r) { S.mesas = r.rows; S.mesasResumo = r.resumo; S.mesasHora = Date.now(); gravar('pos_mesas', S.mesas); gravar('pos_mesas_hora', S.mesasHora); faixa(); }).catch(function () { }); else faixa(); }, 30000);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () { });
   render();
   if (S.sess && navigator.onLine) { atualizar(true).then(function () { sincronizar(true); }); }
