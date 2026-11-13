@@ -13,7 +13,7 @@
 
   var S = {
     url: ler('pos_url', ''), sess: ler('pos_sess', null), boot: ler('pos_boot', null), refs: ler('pos_refs', null), caixa: ler('pos_caixa', null),
-    fila: ler('pos_fila', []), dev: ler('pos_dev', null), seq: ler('pos_seq', 0), cart: [], cat: '', q: '', online: navigator.onLine, aSincronizar: false
+    fila: ler('pos_fila', []), mesas: ler('pos_mesas', []), mesaAtiva: null, dev: ler('pos_dev', null), seq: ler('pos_seq', 0), cart: [], cat: '', q: '', online: navigator.onLine, aSincronizar: false
   };
   if (!S.dev) { S.dev = 'T' + Math.random().toString(36).slice(2, 5).toUpperCase(); gravar('pos_dev', S.dev); }
 
@@ -60,8 +60,11 @@
     function prox() {
       if (i >= lista.length) return Promise.resolve();
       var v = lista[i++];
-      return chamar('venda_guardar', { chave: v.chave, estado: 'Paga', itens: v.itens, pagamentos: v.pagamentos, mesa: v.mesa || '', desconto: 0 }).then(function (r) {
-        v.estado = 'enviada'; v.num = r.num; guardarFila(); return prox();
+      var req = v.tipo === 'pedido' ? chamar('mesa_pedido', { chave: v.chave, id: v.mesaId || '', mesa: v.mesa, itens: v.itens }) : chamar('venda_guardar', { chave: v.chave, estado: 'Paga', itens: v.itens, pagamentos: v.pagamentos, mesa: v.mesa || '', desconto: 0 });
+      return req.then(function (r) {
+        v.estado = 'enviada';
+        if (v.tipo === 'pedido') { v.num = 'Pedido ' + r.pedido + ' · mesa ' + r.mesa; if (v.mesaId && r.id !== v.mesaId) v.aviso = 'A mesa já tinha sido cobrada: abriu-se uma conta nova.'; } else v.num = r.num;
+        guardarFila(); return prox();
       }, function (e) {
         if (e.rede) throw e;
         if (/Sess[aã]o expirada/i.test(e.message)) { var er = new Error(e.message); er.sessao = true; throw er; }
@@ -75,8 +78,8 @@
   }
   function atualizar(silencioso) {
     if (!S.sess) return Promise.resolve();
-    return Promise.all([chamar('bootstrap', {}), chamar('refs', {}), chamar('caixa_estado', {})]).then(function (r) {
-      S.boot = r[0]; S.refs = r[1]; S.caixa = r[2]; gravar('pos_boot', S.boot); gravar('pos_refs', S.refs); gravar('pos_caixa', S.caixa); gravar('pos_hora', Date.now());
+    return Promise.all([chamar('bootstrap', {}), chamar('refs', {}), chamar('caixa_estado', {}), chamar('mesas_abertas', {})]).then(function (r) {
+      S.boot = r[0]; S.refs = r[1]; S.caixa = r[2]; S.mesas = r[3].rows; gravar('pos_mesas', S.mesas); gravar('pos_boot', S.boot); gravar('pos_refs', S.refs); gravar('pos_caixa', S.caixa); gravar('pos_hora', Date.now());
       if (!silencioso) toast('Dados atualizados.'); render();
     }).catch(function (e) { if (e.servidor && /Sess[aã]o expirada/i.test(e.message)) { S.sess = null; gravar('pos_sess', null); render(); } barra(); });
   }
@@ -107,8 +110,9 @@
     var p = pendentes().length, er = comErro().length;
     el.innerHTML = '<b>' + esc((S.boot && S.boot.cfg && S.boot.cfg.EMPRESA) || 'POS') + '</b><span class="dot ' + (S.online ? 'on' : '') + '"></span><span class="mut">' + (S.online ? 'online' : 'offline') + '</span><span class="sp"></span>' +
       (p ? '<span class="badge">' + p + ' por enviar</span>' : '') + (er ? '<span class="badge" style="background:var(--bad);color:#fff">' + er + ' com erro</span>' : '') +
-      '<button class="sec" id="bs">' + (S.aSincronizar ? 'A enviar…' : 'Sincronizar') + '</button><button class="sec" id="bf">Vendas</button><button class="sec" id="bx">Sair</button>';
+      '<button class="sec" id="bs">' + (S.aSincronizar ? 'A enviar…' : 'Sincronizar') + '</button><button class="sec" id="bm">Mesas</button><button class="sec" id="bf">Vendas</button><button class="sec" id="bx">Sair</button>';
     $('#bs').onclick = function () { sincronizar(false); };
+    $('#bm').onclick = ecraMesas;
     $('#bf').onclick = ecraFila;
     $('#bx').onclick = function () {
       if (pendentes().length && !confirm('Há vendas por enviar. Elas ficam guardadas neste aparelho, mas só serão enviadas quando entrar de novo. Sair?')) return;
@@ -116,7 +120,7 @@
     };
   }
   function cashLocal() {
-    var s = 0; pendentes().forEach(function (v) { v.pagamentos.forEach(function (p) { if (p.forma === 'NUMERARIO') s += p.valor; }); }); return s;
+    var s = 0; pendentes().forEach(function (v) { (v.pagamentos || []).forEach(function (p) { if (p.forma === 'NUMERARIO') s += p.valor; }); }); return s;
   }
   function ecraPos() {
     var cx = S.caixa && S.caixa.aberta, k = S.caixa && S.caixa.calc;
@@ -150,16 +154,107 @@
     carrinho();
   }
   function carrinho() {
-    var t = totais(S.cart, 0);
-    $('#cart').innerHTML = '<h3 style="margin-top:0">Venda</h3>' + (S.cart.length ? S.cart.map(function (i) {
+    var t = totais(S.cart, 0), ma = S.mesaAtiva;
+    $('#cart').innerHTML = (ma ? '<h3 style="margin-top:0">Mesa ' + esc(ma.mesa) + '</h3>' + jaPedido(ma) : '<h3 style="margin-top:0">Venda</h3>') + (S.cart.length ? S.cart.map(function (i) {
       var p = prod(i.produtoId) || { nome: '?', precoVenda: 0 };
       return '<div class="l"><div style="flex:1"><b>' + esc(p.nome) + '</b><div class="mut">' + fmt(p.precoVenda * i.qtd) + '</div></div><div class="q"><button class="sec" data-m="' + i.produtoId + '">−</button><b>' + i.qtd + '</b><button class="sec" data-p="' + i.produtoId + '">+</button></div></div>';
     }).join('') : '<p class="mut">Toque nos produtos para adicionar.</p>') +
-      '<div class="total">' + fmt(t.total) + ' FCFA</div><div class="row"><button class="sec" id="lm">Limpar</button><button id="cb">Cobrar</button></div>';
+      '<div class="total">' + fmt(t.total) + ' FCFA</div>' +
+      (ma ? '<div class="row"><button class="sec" id="lm">Sair da mesa</button><button class="sec" id="ep">Enviar pedido</button><button id="cb">Cobrar mesa</button></div><p class="mut" style="font-size:12px">Cobrar a mesa precisa de internet.</p>'
+          : '<div class="row"><button class="sec" id="lm">Limpar</button><button class="sec" id="mz">Mesas</button><button id="cb">Cobrar</button></div>');
     $$('[data-m]').forEach(function (b) { b.onclick = function () { add(b.getAttribute('data-m'), -1); }; });
     $$('[data-p]').forEach(function (b) { b.onclick = function () { add(b.getAttribute('data-p'), 1); }; });
-    $('#lm').onclick = function () { S.cart = []; carrinho(); };
-    $('#cb').onclick = cobrar;
+    $('#lm').onclick = function () { S.cart = []; S.mesaAtiva = null; carrinho(); };
+    if ($('#mz')) $('#mz').onclick = ecraMesas;
+    if (ma) { $('#ep').onclick = enviarPedido; $('#cb').onclick = cobrarMesa; } else $('#cb').onclick = cobrar;
+  }
+  function chaveMesa(n) { return String(n || '').trim().toLowerCase(); }
+  function linhasMesa(m) {
+    var l = (m.linhas || []).map(function (x) { return { nome: x.nome, qtd: x.qtd, quem: x.pedidoPor, pend: false }; });
+    S.fila.forEach(function (v) {
+      if (v.tipo === 'pedido' && v.estado !== 'enviada' && ((v.mesaId && v.mesaId === m.id) || (!v.mesaId && chaveMesa(v.mesa) === chaveMesa(m.mesa)))) {
+        v.snap.forEach(function (i) { l.push({ nome: i.nome, qtd: i.qtd, quem: v.operador, pend: true }); });
+      }
+    });
+    return l;
+  }
+  function jaPedido(m) {
+    var l = linhasMesa(m);
+    return '<div class="note" style="margin:6px 0"><b>Já pedido</b>' + (l.length ? l.map(function (x) { return '<div style="font-size:13px">' + x.qtd + '× ' + esc(x.nome) + ' <span class="mut">· ' + esc(x.quem || '') + (x.pend ? ' (por enviar)' : '') + '</span></div>'; }).join('') : '<div class="mut" style="font-size:13px">Mesa nova.</div>') + '</div>';
+  }
+  function ecraMesas() {
+    var lista = S.mesas.slice();
+    S.fila.forEach(function (v) { // mesas abertas só neste aparelho (pedido ainda por enviar)
+      if (v.tipo === 'pedido' && v.estado !== 'enviada' && !lista.some(function (m) { return chaveMesa(m.mesa) === chaveMesa(v.mesa); })) lista.push({ id: '', mesa: v.mesa, operador: v.operador, total: 0, linhas: [], nova: true });
+    });
+    modal('<h3 style="margin-top:0">Mesas abertas</h3>' + (S.online ? '' : '<p class="mut">Offline: lista da última sincronização.</p>') + (lista.length ? '<table>' + lista.map(function (m, ix) {
+      return '<tr><td><b>' + esc(m.mesa) + '</b><div class="mut">' + esc(m.operador || '') + (m.nova ? ' · só neste aparelho' : '') + '</div></td><td style="text-align:right">' + fmt(m.total) + '</td><td><button data-ix="' + ix + '">Abrir</button></td></tr>';
+    }).join('') + '</table>' : '<p class="mut">Não há mesas abertas.</p>') + '<div class="f" style="margin-top:12px"><label>Nova mesa</label><input id="nm" placeholder="nome ou número"></div><div class="row acts"><button class="sec" id="mx">Fechar</button><button id="mk">Abrir mesa</button></div>', function (m) {
+      $('#mx', m).onclick = function () { m.remove(); };
+      $$('[data-ix]', m).forEach(function (b) { b.onclick = function () { var x = lista[Number(b.getAttribute('data-ix'))]; S.mesaAtiva = { id: x.id, mesa: x.mesa, linhas: x.linhas || [] }; S.cart = []; m.remove(); carrinho(); }; });
+      $('#mk', m).onclick = function () {
+        var n = $('#nm', m).value.trim(); if (!n) return toast('Indique o nome da mesa.', true);
+        var ex = lista.filter(function (x) { return chaveMesa(x.mesa) === chaveMesa(n); })[0];
+        S.mesaAtiva = ex ? { id: ex.id, mesa: ex.mesa, linhas: ex.linhas || [] } : { id: '', mesa: n, linhas: [] }; S.cart = []; m.remove(); carrinho();
+      };
+    });
+  }
+  function enfileirarPedido() {
+    var ma = S.mesaAtiva;
+    S.seq++; gravar('pos_seq', S.seq);
+    var v = { tipo: 'pedido', chave: chave(), local: S.dev + '-P' + ('0000' + S.seq).slice(-4), ts: new Date().toISOString(), mesa: ma.mesa, mesaId: ma.id || '', itens: S.cart.map(function (i) { return { produtoId: i.produtoId, qtd: i.qtd }; }), estado: 'pendente',
+      snap: S.cart.map(function (i) { var p = prod(i.produtoId) || {}; return { nome: p.nome, qtd: i.qtd }; }), operador: S.sess.user.nome };
+    S.fila.push(v); guardarFila(); S.cart = []; return v;
+  }
+  function enviarPedido() {
+    if (!S.cart.length) return toast('Adicione produtos ao pedido.', true);
+    var nome = S.mesaAtiva.mesa;
+    enfileirarPedido(); S.mesaAtiva = null; carrinho(); barra();
+    toast('Pedido guardado para a mesa ' + nome + (S.online ? '.' : ' (será enviado quando houver internet).'));
+    if (S.online) sincronizar(true);
+  }
+  function cobrarMesa() {
+    if (!S.online || !navigator.onLine) return toast('Sem internet: para cobrar a mesa é preciso ligação. Pode continuar a enviar pedidos.', true);
+    if (!(S.caixa && S.caixa.aberta)) return toast('Sem caixa aberta.', true);
+    var ma = S.mesaAtiva, btn = $('#cb'); btn.disabled = true;
+    if (S.cart.length) enfileirarPedido();
+    sincronizar(true).then(function () {
+      if (pendentes().length) throw new Error('Há pedidos por enviar. Carregue em Sincronizar e tente outra vez.');
+      return chamar('mesas_abertas', {});
+    }).then(function (r) {
+      var m = r.rows.filter(function (x) { return chaveMesa(x.mesa) === chaveMesa(ma.mesa); })[0];
+      if (!m) throw new Error('Mesa não encontrada: pode já ter sido cobrada.');
+      return chamar('venda_detalhe', { id: m.id });
+    }).then(function (d) {
+      btn.disabled = false; S.mesaAtiva = { id: d.venda.id, mesa: d.venda.mesa, linhas: d.itens }; carrinho();
+      pagamentoMesa(d);
+    }).catch(function (e) { btn.disabled = false; toast(e.message, true); carrinho(); });
+  }
+  function pagamentoMesa(d) {
+    var tot = d.venda.total, formas = (S.boot && S.boot.formas) || { NUMERARIO: 'Numerário', MOBILE_MONEY: 'Mobile Money', CARTAO: 'Cartão' };
+    var kc = 'pos_cp_' + d.venda.id; var ck = ler(kc, null); if (!ck) { ck = chave(); gravar(kc, ck); }
+    modal('<h3 style="margin-top:0">Cobrar mesa ' + esc(d.venda.mesa) + '</h3>' + d.itens.map(function (i) { return '<div style="font-size:13px">' + i.qtd + '× ' + esc(i.nome) + ' <span class="mut">· ' + esc(i.pedidoPor || '') + '</span></div>'; }).join('') +
+      '<div class="total">' + fmt(tot) + ' FCFA</div>' + Object.keys(formas).map(function (f) { return '<div class="f"><label>' + esc(formas[f]) + '</label><input class="pg" data-f="' + f + '" inputmode="numeric" value="' + (f === 'NUMERARIO' ? tot : '') + '"></div>'; }).join('') +
+      '<div class="f" id="rfw" style="display:none"><label>Referência Mobile Money</label><input id="rf"></div><div id="pr" class="note"></div><div class="row"><button class="sec" data-todo="MOBILE_MONEY">Tudo Mobile Money</button><button class="sec" data-todo="NUMERARIO">Tudo numerário</button></div><div class="row acts" style="margin-top:10px"><button class="sec" id="cx">Voltar</button><button id="ok">Confirmar</button></div>', function (m) {
+      function soma() { return $$('.pg', m).reduce(function (a, i) { return a + (Number(i.value) || 0); }, 0); }
+      function res() { var dif = tot - soma(); $('#rfw', m).style.display = (Number($('.pg[data-f="MOBILE_MONEY"]', m).value) || 0) > 0 ? '' : 'none'; $('#pr', m).innerHTML = dif === 0 ? '<span class="ok">Pagamento completo.</span>' : dif > 0 ? 'Falta receber <b>' + fmt(dif) + '</b>' : '<span class="bad-t">Excede em ' + fmt(-dif) + '</span>'; }
+      $$('.pg', m).forEach(function (i) { i.oninput = res; });
+      $$('[data-todo]', m).forEach(function (b) { b.onclick = function () { $$('.pg', m).forEach(function (i) { i.value = i.getAttribute('data-f') === b.getAttribute('data-todo') ? tot : ''; }); res(); }; });
+      res(); $('#cx', m).onclick = function () { m.remove(); };
+      $('#ok', m).onclick = function () {
+        if (soma() !== tot) return toast('O pagamento tem de ser igual ao total.', true);
+        var pags = $$('.pg', m).filter(function (i) { return Number(i.value) > 0; }).map(function (i) { var f = i.getAttribute('data-f'); return { forma: f, valor: Math.round(Number(i.value)), ref: f === 'MOBILE_MONEY' ? $('#rf', m).value.trim() : '' }; });
+        var mm = pags.filter(function (p) { return p.forma === 'MOBILE_MONEY'; })[0];
+        if (mm && mm.ref.length < 4) return toast('Indique a referência do Mobile Money.', true);
+        var b = this; b.disabled = true;
+        chamar('mesa_cobrar', { chave: ck, id: d.venda.id, pagamentos: pags }).then(function (r) {
+          m.remove(); try { LS.removeItem(kc); } catch (e) { /* ignora */ }
+          S.mesaAtiva = null; S.cart = []; carrinho();
+          recibo({ num: r.num, ts: new Date().toISOString(), operador: S.sess.user.nome, snap: d.itens.map(function (i) { return { nome: i.nome, qtd: i.qtd, total: i.total }; }), total: r.total, igv: r.igv, pagamentos: pags });
+          atualizar(true);
+        }).catch(function (e) { b.disabled = false; toast(e.rede ? 'Sem ligação: nada foi cobrado ainda. Tente outra vez (não há risco de cobrar duas vezes).' : e.message, true); });
+      };
+    });
   }
   function modal(html, montar) {
     var m = document.createElement('div'); m.className = 'modal'; m.innerHTML = '<div class="mbox">' + html + '</div>'; document.body.appendChild(m);
@@ -189,7 +284,7 @@
         if (soma() !== t.total) return toast('O pagamento tem de ser igual ao total.', true);
         var mm = pags.filter(function (p) { return p.forma === 'MOBILE_MONEY'; })[0];
         if (mm && mm.ref.length < 4) return toast('Indique a referência do Mobile Money.', true);
-        if (mm && S.fila.some(function (v) { return v.pagamentos.some(function (p) { return p.ref && p.ref.toLowerCase() === mm.ref.toLowerCase(); }); })) return toast('Essa referência já foi usada neste aparelho.', true);
+        if (mm && S.fila.some(function (v) { return (v.pagamentos || []).some(function (p) { return p.ref && p.ref.toLowerCase() === mm.ref.toLowerCase(); }); })) return toast('Essa referência já foi usada neste aparelho.', true);
         S.seq++; gravar('pos_seq', S.seq);
         var v = { chave: chave(), local: S.dev + '-' + ('0000' + S.seq).slice(-4), ts: new Date().toISOString(), itens: S.cart.map(function (i) { return { produtoId: i.produtoId, qtd: i.qtd }; }), pagamentos: pags, total: t.total, igv: t.igv, estado: 'pendente', snap: S.cart.map(function (i) { var p = prod(i.produtoId) || {}; return { nome: p.nome, qtd: i.qtd, preco: p.precoVenda, total: Math.round((p.precoVenda || 0) * i.qtd) }; }), operador: S.sess.user.nome };
         S.fila.push(v); guardarFila(); S.cart = []; m.remove(); recibo(v); carrinho(); barra();
@@ -207,7 +302,7 @@
     var hoje = S.fila.slice().reverse();
     modal('<h3 style="margin-top:0">Vendas neste aparelho</h3>' + (hoje.length ? '<table>' + hoje.slice(0, 80).map(function (v) {
       var cor = v.estado === 'enviada' ? 'ok' : v.estado === 'erro' ? 'bad-t' : '';
-      return '<tr><td>' + esc(v.num || v.local) + '<div class="mut">' + new Date(v.ts).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) + '</div></td><td style="text-align:right">' + fmt(v.total) + '</td><td class="' + cor + '">' + (v.estado === 'enviada' ? 'enviada' : v.estado === 'erro' ? 'erro' : 'por enviar') + (v.erro ? '<div style="font-size:12px">' + esc(v.erro) + '</div>' : '') + '</td><td>' + (v.estado === 'erro' ? '<button class="sec" data-rt="' + v.chave + '">Tentar</button> ' : '') + '</td></tr>';
+      return '<tr><td>' + esc(v.num || (v.tipo === 'pedido' ? 'Pedido mesa ' + v.mesa : v.local)) + (v.aviso ? '<div class="bad-t" style="font-size:12px">' + esc(v.aviso) + '</div>' : '') + '<div class="mut">' + new Date(v.ts).toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' }) + '</div></td><td style="text-align:right">' + (v.tipo === 'pedido' ? '—' : fmt(v.total)) + '</td><td class="' + cor + '">' + (v.estado === 'enviada' ? 'enviada' : v.estado === 'erro' ? 'erro' : 'por enviar') + (v.erro ? '<div style="font-size:12px">' + esc(v.erro) + '</div>' : '') + '</td><td>' + (v.estado === 'erro' ? '<button class="sec" data-rt="' + v.chave + '">Tentar</button> ' : '') + '</td></tr>';
     }).join('') + '</table>' : '<p class="mut">Ainda não há vendas.</p>') + '<div class="row acts" style="margin-top:10px"><button class="sec" id="lp">Limpar enviadas</button><button id="fc">Fechar</button></div>', function (m) {
       $('#fc', m).onclick = function () { m.remove(); };
       $('#lp', m).onclick = function () { S.fila = S.fila.filter(function (v) { return v.estado !== 'enviada'; }); guardarFila(); m.remove(); barra(); };
