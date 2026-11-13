@@ -28,12 +28,16 @@
     if (!S.url) return Promise.reject(new Error('Falta o endereço do servidor.'));
     var ctrl = new AbortController(), tm = setTimeout(function () { ctrl.abort(); }, 20000);
     return fetch(S.url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ token: S.sess ? S.sess.token : null, acao: acao, payload: payload || {} }), signal: ctrl.signal, redirect: 'follow' })
-      .then(function (r) { clearTimeout(tm); return r.json(); })
-      .then(function (j) {
+      .then(function (r) { clearTimeout(tm); return r.text(); }, function (e) { clearTimeout(tm); S.online = false; var er = new Error('Sem ligação ao servidor (' + (e && e.name === 'AbortError' ? 'demorou demasiado' : 'a rede ou o acesso "Qualquer pessoa" do Apps Script pode estar a falhar') + ').'); er.rede = true; throw er; })
+      .then(function (t) {
+        var j; try { j = JSON.parse(t); } catch (e) {
+          S.online = false; var er = new Error('O servidor respondeu algo inesperado. Confirme no Apps Script: implantação "Qualquer pessoa" e Nova versão com o Code.gs mais recente (tem de ter doPost). Início da resposta: ' + String(t).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140));
+          er.rede = true; throw er;
+        }
         S.online = true;
-        if (!j.ok) { var e = new Error(j.erro || 'Erro'); e.servidor = true; throw e; }
+        if (!j.ok) { var e2 = new Error(j.erro || 'Erro'); e2.servidor = true; throw e2; }
         return j.data;
-      }, function (e) { clearTimeout(tm); S.online = false; var er = new Error('Sem ligação ao servidor.'); er.rede = true; throw er; });
+      });
   }
 
   /* ---------- cálculo (igual ao servidor) ---------- */
